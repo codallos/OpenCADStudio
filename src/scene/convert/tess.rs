@@ -960,7 +960,14 @@ fn tessellate_entity_inner(
 
     // Render non-annotative dimensions from their stored picture block.
     // Rebuild geometry only when no usable block exists.
-    if matches!(e, EntityType::Dimension(_)) {
+    // Diameter uses live tessellation so its geometry stays consistent with
+    // current diameter text/leader placement instead of a stale stored *D block.
+    if matches!(e, EntityType::Dimension(_))
+        && !matches!(
+            e,
+            EntityType::Dimension(acadrust::entities::Dimension::Diameter(_))
+        )
+    {
         if let Some(block_use) = crate::scene::render_graph::entity_render_block_uses(
             document,
             e,
@@ -1797,4 +1804,110 @@ pub(crate) fn is_unindexable_entity(e: &acadrust::EntityType) -> bool {
         e,
         E::Insert(_) | E::Viewport(_) | E::Block(_) | E::BlockEnd(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acadrust::entities::{Dimension, DimensionDiameter, DimensionLinear, Line};
+    use acadrust::tables::BlockRecord;
+    use acadrust::types::Vector3;
+    use acadrust::{CadDocument, EntityType};
+
+    fn add_sentinel_picture_block(doc: &mut CadDocument, name: &str) -> String {
+        let block_handle = doc.allocate_handle();
+        let mut block = BlockRecord::new(name);
+        block.handle = block_handle;
+        doc.block_records.add(block).unwrap();
+
+        let mut line = Line::new();
+        line.start = Vector3::new(1000.0, 2000.0, 0.0);
+        line.end = Vector3::new(1010.0, 2000.0, 0.0);
+        line.common.owner_handle = block_handle;
+        doc.add_entity(EntityType::Line(line)).unwrap();
+
+        name.to_string()
+    }
+
+    fn tessellate_for_test(doc: &CadDocument, entity: &EntityType) -> Vec<WireModel> {
+        let selected = rustc_hash::FxHashSet::default();
+        tessellate_entity(
+            doc,
+            &selected,
+            None,
+            [1.0, 1.0, 1.0, 1.0],
+            1.0,
+            None,
+            entity,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    fn has_sentinel_picture_geometry(wires: &[WireModel]) -> bool {
+        wires.iter().any(|wire| {
+            wire.points.iter().enumerate().any(|(index, point)| {
+                if !point[0].is_finite() || !point[1].is_finite() {
+                    return false;
+                }
+                let low = wire.points_low.get(index).copied().unwrap_or([0.0; 3]);
+                let x = point[0] as f64 + low[0] as f64;
+                let y = point[1] as f64 + low[1] as f64;
+                ((x - 1000.0).abs() < 1.0e-6 || (x - 1010.0).abs() < 1.0e-6)
+                    && (y - 2000.0).abs() < 1.0e-6
+            })
+        })
+    }
+
+    #[test]
+    fn diameter_with_stored_picture_block_uses_live_tessellation() {
+        let mut doc = CadDocument::new();
+        let block_name = add_sentinel_picture_block(&mut doc, "*D_DIAMETER_SENTINEL");
+        let mut dim = DimensionDiameter::new(
+            Vector3::new(10.0, 0.0, 0.0),
+            Vector3::new(-10.0, 0.0, 0.0),
+        );
+        dim.base.text_middle_point = Vector3::new(18.0, 0.0, 0.0);
+        let handle = doc
+            .add_entity(EntityType::Dimension(Dimension::Diameter(dim)))
+            .unwrap();
+        if let Some(EntityType::Dimension(dimension)) = doc.get_entity_mut(handle) {
+            dimension.base_mut().block_name = block_name;
+        }
+
+        let wires = tessellate_for_test(&doc, doc.get_entity(handle).unwrap());
+
+        assert!(!wires.is_empty(), "diameter should produce live geometry");
+        assert!(
+            !has_sentinel_picture_geometry(&wires),
+            "diameter viewport render must not use its stored picture block"
+        );
+    }
+
+    #[test]
+    fn non_diameter_dimension_with_stored_picture_block_keeps_picture_representation() {
+        let mut doc = CadDocument::new();
+        let block_name = add_sentinel_picture_block(&mut doc, "*D_LINEAR_SENTINEL");
+        let mut dim = DimensionLinear::new(
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(10.0, 0.0, 0.0),
+        );
+        dim.definition_point = Vector3::new(0.0, 5.0, 0.0);
+        dim.base.text_middle_point = Vector3::new(5.0, 5.0, 0.0);
+        let handle = doc
+            .add_entity(EntityType::Dimension(Dimension::Linear(dim)))
+            .unwrap();
+        if let Some(EntityType::Dimension(dimension)) = doc.get_entity_mut(handle) {
+            dimension.base_mut().block_name = block_name;
+        }
+
+        let wires = tessellate_for_test(&doc, doc.get_entity(handle).unwrap());
+
+        assert!(
+            has_sentinel_picture_geometry(&wires),
+            "non-diameter dimensions should keep using stored picture blocks"
+        );
+    }
 }
